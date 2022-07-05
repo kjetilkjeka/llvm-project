@@ -1315,6 +1315,8 @@ std::string NVPTXTargetLowering::getPrototype(
       // PTX, so its size must be adjusted here, too.
       if (size < 32)
         size = 32;
+      else if (size > 32 && size < 64)
+        size = 64;
 
       O << ".param .b" << size << " _";
     } else if (isa<PointerType>(retTy)) {
@@ -1367,6 +1369,8 @@ std::string NVPTXTargetLowering::getPrototype(
         sz = cast<IntegerType>(Ty)->getBitWidth();
         if (sz < 32)
           sz = 32;
+        else if (sz > 32 && sz < 64)
+          sz = 64;
       } else if (isa<PointerType>(Ty)) {
         sz = PtrVT.getSizeInBits();
       } else if (Ty->isHalfTy())
@@ -1542,6 +1546,8 @@ SDValue NVPTXTargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
         // size. FP16 is loaded/stored using i16, so it's handled
         // here as well.
         TypeSize = 4;
+      } else if (VT.isInteger() && TypeSize > 4 && TypeSize < 8) {
+        TypeSize = 8;
       }
       SDValue DeclareScalarParamOps[] = {
           Chain, DAG.getConstant(ParamCount, dl, MVT::i32),
@@ -1671,6 +1677,8 @@ SDValue NVPTXTargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
       // Scalar needs to be at least 32bit wide
       if (resultsz < 32)
         resultsz = 32;
+      else if (resultsz > 32 && resultsz < 64)
+        resultsz = 64;
       SDVTList DeclareRetVTs = DAG.getVTList(MVT::Other, MVT::Glue);
       SDValue DeclareRetOps[] = { Chain, DAG.getConstant(1, dl, MVT::i32),
                                   DAG.getConstant(resultsz, dl, MVT::i32),
