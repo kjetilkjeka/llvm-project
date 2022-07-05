@@ -206,6 +206,28 @@ static void ComputePTXValueVTs(const TargetLowering &TLI, const DataLayout &DL,
   }
 }
 
+/// PromoteScalarIntegerPTX
+/// Used to make sure the arguments/returns are suitable for passing 
+/// and promote them to a larger size if they're not.
+static bool PromoteScalarIntegerPTX(const EVT &VT, MVT *PromotedVT) {
+  if (VT.isScalarInteger()) {
+    if (1 < VT.getFixedSizeInBits() && VT.getFixedSizeInBits() < 8) {
+      *PromotedVT = MVT::i8;
+      return true;
+    } else if (8 < VT.getFixedSizeInBits() && VT.getFixedSizeInBits() < 16) {
+      *PromotedVT = MVT::i16;
+       return true;
+    } else if (16 < VT.getFixedSizeInBits() && VT.getFixedSizeInBits() < 32) {
+      *PromotedVT = MVT::i32;
+      return true;
+    } else if (32 < VT.getFixedSizeInBits() && VT.getFixedSizeInBits() < 64) {
+      *PromotedVT = MVT::i64;
+      return true;
+    }
+  } 
+  return false;
+}
+
 // Check whether we can merge loads/stores of some of the pieces of a
 // flattened function parameter or return value into a single vector
 // load/store.
@@ -1556,6 +1578,14 @@ SDValue NVPTXTargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
       }
 
       SDValue StVal = OutVals[OIdx];
+
+      MVT PromotedVT;
+      if (PromoteScalarIntegerPTX(EltVT, &PromotedVT)) {
+        llvm::ISD::NodeType Ext = Outs[OIdx].Flags.isSExt() ? ISD::SIGN_EXTEND : ISD::ZERO_EXTEND;
+        StVal = DAG.getNode(Ext, dl, PromotedVT, StVal);
+        EltVT = EVT(PromotedVT);
+      }
+
       if (IsByVal) {
         auto PtrVT = getPointerTy(DL);
         SDValue srcAddr = DAG.getNode(ISD::ADD, dl, PtrVT, StVal,
@@ -1778,6 +1808,14 @@ SDValue NVPTXTargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
       EVT TheLoadType = VTs[i];
       EVT EltType = Ins[i].VT;
       Align EltAlign = commonAlignment(RetAlign, Offsets[i]);
+      MVT PromotedVT;
+      
+      if (PromoteScalarIntegerPTX(TheLoadType, &PromotedVT)) {
+        TheLoadType = EVT(PromotedVT);
+        EltType = EVT(PromotedVT);
+        needTruncate = true;
+      }
+
       if (ExtendIntegerRetVal) {
         TheLoadType = MVT::i32;
         EltType = MVT::i32;
@@ -2558,6 +2596,15 @@ SDValue NVPTXTargetLowering::LowerFormalArguments(
             // v2f16 was loaded as an i32. Now we must bitcast it back.
             else if (EltVT == MVT::v2f16)
               Elt = DAG.getNode(ISD::BITCAST, dl, MVT::v2f16, Elt);
+
+            // If a non standard integer type is used promote to next standard
+            MVT PromotedVT;
+            if (PromoteScalarIntegerPTX(Ins[InsIdx].VT, &PromotedVT)) {
+              llvm::ISD::NodeType Ext = Ins[InsIdx].Flags.isSExt() ? ISD::SIGN_EXTEND : ISD::ZERO_EXTEND;
+              Elt = DAG.getNode(Ext, dl, PromotedVT, Elt);
+              VTs[i] = EVT(PromotedVT);
+            }
+
             // Extend the element if necessary (e.g. an i8 is loaded
             // into an i16 register)
             if (Ins[InsIdx].VT.isInteger() &&
@@ -2627,10 +2674,22 @@ NVPTXTargetLowering::LowerReturn(SDValue Chain, CallingConv::ID CallConv,
     return Chain;
 
   const DataLayout &DL = DAG.getDataLayout();
+  SmallVector<SDValue, 16> PromotedOutVals;
   SmallVector<EVT, 16> VTs;
   SmallVector<uint64_t, 16> Offsets;
   ComputePTXValueVTs(*this, DL, RetTy, VTs, &Offsets);
   assert(VTs.size() == OutVals.size() && "Bad return value decomposition");
+
+  for (unsigned i = 0, e = VTs.size(); i != e; ++i) {
+    SDValue PromotedOutVal = OutVals[i];
+    MVT PromotedVT;
+    if (PromoteScalarIntegerPTX(VTs[i], &PromotedVT)) {
+      llvm::ISD::NodeType Ext = Outs[i].Flags.isSExt() ? ISD::SIGN_EXTEND : ISD::ZERO_EXTEND;
+      PromotedOutVal = DAG.getNode(Ext, dl, PromotedVT, PromotedOutVal);
+      VTs[i] = EVT(PromotedVT);
+    }
+    PromotedOutVals.push_back(PromotedOutVal);
+  }
 
   auto VectorInfo = VectorizePTXValueVTs(
       VTs, Offsets,
@@ -2652,12 +2711,14 @@ NVPTXTargetLowering::LowerReturn(SDValue Chain, CallingConv::ID CallConv,
       StoreOperands.push_back(DAG.getConstant(Offsets[i], dl, MVT::i32));
     }
 
-    SDValue RetVal = OutVals[i];
+    SDValue OutVal = OutVals[i];
+    SDValue RetVal = PromotedOutVals[i];
+
     if (ExtendIntegerRetVal) {
       RetVal = DAG.getNode(Outs[i].Flags.isSExt() ? ISD::SIGN_EXTEND
                                                   : ISD::ZERO_EXTEND,
                            dl, MVT::i32, RetVal);
-    } else if (RetVal.getValueSizeInBits() < 16) {
+    } else if (OutVal.getValueSizeInBits() < 16) {
       // Use 16-bit registers for small load-stores as it's the
       // smallest general purpose register size supported by NVPTX.
       RetVal = DAG.getNode(ISD::ANY_EXTEND, dl, MVT::i16, RetVal);
